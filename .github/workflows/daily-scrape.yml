@@ -1,0 +1,71 @@
+name: Daily NZ grocery prices
+
+on:
+  schedule:
+    # 14:00 UTC = 2:00am NZST / 3:00am NZDT. GitHub may start scheduled runs a little late.
+    - cron: '0 14 * * *'
+  workflow_dispatch:
+    inputs:
+      chains:
+        description: 'Chains, comma separated (blank = all): woolworths,new_world,paknsave,freshchoice,supervalue'
+        required: false
+      max_stores:
+        description: 'Max stores per chain (blank = all) — use 1 for a quick test'
+        required: false
+      full_refresh:
+        description: 'Send every price to the app, not just changes'
+        type: boolean
+        default: false
+
+concurrency:
+  group: grocery-scrape
+  cancel-in-progress: false
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+    timeout-minutes: 340
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      # Yesterday's snapshot lets the scraper send only prices that changed.
+      - name: Restore last snapshot
+        uses: actions/cache/restore@v4
+        with:
+          path: state
+          key: price-snapshot-${{ github.run_id }}
+          restore-keys: price-snapshot-
+
+      - name: Scrape prices
+        env:
+          INGEST_URL: ${{ secrets.INGEST_URL }}
+          INGEST_SECRET: ${{ secrets.INGEST_SECRET }}
+          CHAINS: ${{ inputs.chains || vars.CHAINS }}
+          MAX_STORES: ${{ inputs.max_stores }}
+          FULL_REFRESH: ${{ inputs.full_refresh }}
+          NEW_WORLD_STORES: ${{ vars.NEW_WORLD_STORES }}
+          PAKNSAVE_STORES: ${{ vars.PAKNSAVE_STORES }}
+          FRESHCHOICE_STORES: ${{ vars.FRESHCHOICE_STORES }}
+          SUPERVALUE_STORES: ${{ vars.SUPERVALUE_STORES }}
+        run: node src/index.js
+
+      # The scraper only advances the snapshot when the app received everything,
+      # so it is safe to save it even when the run reports a failure.
+      - name: Save snapshot
+        if: always() && hashFiles('state/**') != ''
+        uses: actions/cache/save@v4
+        with:
+          path: state
+          key: price-snapshot-${{ github.run_id }}
+
+      - name: Upload price files
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: prices-${{ github.run_id }}
+          path: output/
+          retention-days: 7
