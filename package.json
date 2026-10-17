@@ -1,0 +1,15 @@
+{
+  "name": "nz-grocery-scraper",
+  "version": "1.0.0",
+  "description": "Daily price scraper for New Zealand supermarkets (Woolworths, New World, PAK'nSAVE, FreshChoice, SuperValue).",
+  "type": "module",
+  "private": true,
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "scrape": "node src/index.js",
+    "scrape:test": "node src/index.js --max-stores 1 --max-pages 2 --csv",
+    "mock-ingest": "node tools/mock-ingest.js"
+  }
+}
