@@ -237,7 +237,9 @@ class ChainRun {
       this.storesOk.add(store.store_id);
       this.stats.stores_ok++;
       const idx = `${this.stats.stores_ok + this.stats.stores_failed.length}/${this.stats.stores_total}`;
-      this.log(`(${idx}) ${store.name}: ${count} products in ${Math.round((Date.now() - started) / 1000)}s`);
+      if (globalThis.gc) globalThis.gc(); // only when run with --expose-gc (diagnostics)
+      const heapMb = Math.round(process.memoryUsage().heapUsed / 1e6);
+      this.log(`(${idx}) ${store.name}: ${count} products in ${Math.round((Date.now() - started) / 1000)}s (memory ${heapMb} MB)`);
     } catch (err) {
       this.stats.stores_failed.push({ store_id: store.store_id, name: store.name, error: err.message });
       this.log(`store FAILED ${store.name}: ${err.message}`);
@@ -246,7 +248,10 @@ class ChainRun {
   }
 
   track(r) {
-    const key = `${r.store_id}|${r.product_id}`;
+    // Copy the key into a standalone string. Ids cut out of a web page with a regex can
+    // keep the whole page alive in memory (V8 "sliced strings"); holding them for the
+    // entire run once used up 4 GB on FreshChoice and crashed the nightly job.
+    const key = Buffer.from(`${r.store_id}|${r.product_id}`, 'utf8').toString('utf8');
     const hash = rowHash(r);
     const unchanged = this.current.has(key) || (!this.run.fullRefresh && this.previous?.get(key) === hash);
     this.current.set(key, hash);
