@@ -1,121 +1,64 @@
-name: PriceSmart history backup
+name: Grocer history archive
+
+# Drives PriceSmart's Grocer history archive in short batches. Each request archives
+# one batch and returns within about 2 minutes, so it never depends on the app server
+# keeping a long background job alive.
 
 on:
   schedule:
-    - cron: "17 3 * * 0" # Sundays 03:17 UTC, well clear of the 14:00 UTC scrape
+    - cron: "23 */2 * * *" # every 2 hours; finishes in about a minute once nothing is due
   workflow_dispatch:
 
 env:
   PRICESMART_APP_URL: ${{ vars.PRICESMART_APP_URL }}
-  GH_REPO: ${{ github.repository }}
-  PAGE_LIMIT: "20000"
-
-permissions:
-  contents: write
+  BATCH_LIMIT: "60"
+  BATCH_SECONDS: "90"
+  RUN_MINUTES: "100"
 
 concurrency:
-  group: pricesmart-history-backup
+  group: grocer-history-archive
   cancel-in-progress: false
 
 jobs:
-  backup:
+  archive:
     runs-on: ubuntu-latest
-    timeout-minutes: 180
+    timeout-minutes: 115
     steps:
-      - name: Download history export page by page
+      - name: Archive batches until nothing is due
         env:
           INGEST_SECRET: ${{ secrets.INGEST_SECRET }}
         run: |
-          set -euo pipefail
+          set -uo pipefail
           test -n "$PRICESMART_APP_URL" || { echo "Set the PRICESMART_APP_URL repository variable"; exit 1; }
           test -n "$INGEST_SECRET" || { echo "Set the INGEST_SECRET repository secret"; exit 1; }
-          base="${PRICESMART_APP_URL%/}/api/admin/export/history"
-          date_utc="$(date -u +%F)"
-          asset="pricesmart-history-${date_utc}.ndjson.gz"
+          url="${PRICESMART_APP_URL%/}/api/admin/archive/batch"
+          deadline=$((SECONDS + RUN_MINUTES * 60))
+          batches=0; total=0; errors=0
 
-          fetch() { # fetch <output> <url> [curl args...]
-            local out="$1" url="$2"; shift 2
-            curl --fail --show-error --silent --location --get \
-              --retry 5 --retry-delay 10 --retry-all-errors --max-time 120 \
+          while [ $SECONDS -lt $deadline ]; do
+            status="$(curl --silent --show-error --max-time $((BATCH_SECONDS + 60)) \
+              -o batch.json -w '%{http_code}' -X POST \
               -H "Authorization: Bearer ${INGEST_SECRET}" \
-              -H "Accept: application/x-ndjson" \
-              "$@" "$url" -o "$out"
-          }
+              -H "Content-Type: application/json" \
+              -d "{\"limit\": ${BATCH_LIMIT}, \"maxSeconds\": ${BATCH_SECONDS}}" \
+              "$url")" || status="000"
 
-          fetch manifest.json "$base/manifest"
-          jq -e '.tables | length > 0' manifest.json > /dev/null || { echo "Manifest has no tables:"; head -c 300 manifest.json; exit 1; }
-          echo "Manifest row counts:"; jq -r '.counts | to_entries[] | "  \(.key): \(.value)"' manifest.json
+            if [ "$status" = "409" ]; then
+              echo "Another archive pass is running; waiting 60 s"; sleep 60; continue
+            fi
+            if [ "$status" != "200" ] || ! jq -e '.attempted != null' batch.json > /dev/null 2>&1; then
+              errors=$((errors + 1))
+              echo "Batch request failed (HTTP $status, error $errors of 5): $(head -c 200 batch.json 2>/dev/null)"
+              [ $errors -lt 5 ] || { echo "Too many consecutive errors"; exit 1; }
+              sleep $((errors * 30)); continue
+            fi
+            errors=0; batches=$((batches + 1))
+            archived="$(jq -r '.archived' batch.json)"; total=$((total + archived))
+            jq -r '"batch '"$batches"': attempted \(.attempted), archived \(.archived), failed \(.failed), " +
+                   "\(.durationMs / 1000 | floor)s, not yet archived \(.notYetArchived), still due \(.remaining)"' batch.json
 
-          # Rows per page: small for tables with big rows, large for the 4.7M-row price history.
-          limit_for() {
-            case "$1" in
-              ps_grocer_history_archive) echo 50 ;;
-              ps_products) echo 5000 ;;
-              *) echo "$PAGE_LIMIT" ;;
-            esac
-          }
-
-          : > export.ndjson
-          for table in $(jq -r '.tables[]' manifest.json); do
-            cursor=""; pages=0; rows=0; limit="$(limit_for "$table")"; started=$SECONDS
-            while :; do
-              ok=""
-              for attempt in 1 2 3; do
-                fetch page.ndjson "$base/page" \
-                  --data-urlencode "table=$table" \
-                  --data-urlencode "cursor=$cursor" \
-                  --data-urlencode "limit=$limit"
-                # Every complete page ends with a page_end line; anything else was cut off.
-                if tail -n 1 page.ndjson | jq -e 'select(.type == "page_end")' > page_end.json 2>/dev/null; then ok=1; break; fi
-                echo "  $table page $((pages + 1)) incomplete (attempt $attempt), retrying"; sleep 5
-              done
-              [ -n "$ok" ] || { echo "Could not download a complete page of $table"; head -c 300 page.ndjson; echo; exit 1; }
-
-              head -n -1 page.ndjson >> export.ndjson
-              pages=$((pages + 1)); rows=$((rows + $(jq -r '.rows' page_end.json)))
-              cursor="$(jq -r '.nextCursor // empty' page_end.json)"
-              if [ $((pages % 25)) -eq 0 ]; then echo "  $table: $rows rows so far ($((SECONDS - started))s)"; fi
-              [ -n "$cursor" ] || break
-            done
-            expected="$(jq -r --arg t "$table" '.counts[$t] // "?"' manifest.json)"
-            echo "$table: $rows rows in $pages pages, $((SECONDS - started))s (manifest said $expected)"
+            if [ "$(jq -r '.remaining' batch.json)" = "0" ]; then echo "Nothing left to archive right now"; break; fi
+            if [ "$(jq -r '.attempted' batch.json)" = "0" ]; then echo "Nothing attempted; stopping until next run"; break; fi
           done
 
-          jq -cn --arg at "$(date -u +%FT%TZ)" --slurpfile m manifest.json \
-            '{type: "export_end", exportedAt: $at, counts: $m[0].counts}' >> export.ndjson
-
-          gzip -9 -c export.ndjson > "$asset"
-          gzip -t "$asset"
-          lines="$(gzip -dc "$asset" | wc -l)"
-          echo "Exported $lines lines, $(du -h "$asset" | cut -f1) compressed"
-          test "$lines" -gt 1
-
-          echo "ASSET=$asset" >> "$GITHUB_ENV"
-          echo "DATE_UTC=$date_utc" >> "$GITHUB_ENV"
-
-      - name: Create or replace dated GitHub Release
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          set -euo pipefail
-          tag="pricesmart-history-${DATE_UTC}"
-
-          # Re-running on the same day replaces that day's backup.
-          gh release delete "$tag" --yes --cleanup-tag 2>/dev/null || true
-
-          gh release create "$tag" "$ASSET" \
-            --title "PriceSmart history ${DATE_UTC}" \
-            --notes "Weekly off-site PriceSmart price-history backup."
-
-      - name: Keep only the latest 12 PriceSmart history releases
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          set -euo pipefail
-
-          gh release list --limit 100 --json tagName,createdAt \
-            --jq '[.[] | select(.tagName | startswith("pricesmart-history-"))]
-                  | sort_by(.createdAt) | reverse | .[12:] | .[].tagName' |
-          while read -r old_tag; do
-            [ -z "$old_tag" ] || gh release delete "$old_tag" --yes --cleanup-tag
-          done
+          echo "Done: $total archived in $batches batches over $((SECONDS / 60)) min"
