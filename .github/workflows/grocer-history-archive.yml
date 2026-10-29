@@ -33,7 +33,7 @@ jobs:
           test -n "$INGEST_SECRET" || { echo "Set the INGEST_SECRET repository secret"; exit 1; }
           url="${PRICESMART_APP_URL%/}/api/admin/archive/batch"
           deadline=$((SECONDS + RUN_MINUTES * 60))
-          batches=0; total=0; errors=0
+          batches=0; total=0; errors=0; busy_since=""
 
           while [ $SECONDS -lt $deadline ]; do
             status="$(curl --silent --show-error --max-time $((BATCH_SECONDS + 60)) \
@@ -44,8 +44,16 @@ jobs:
               "$url")" || status="000"
 
             if [ "$status" = "409" ]; then
-              echo "Another archive pass is running; waiting 60 s"; sleep 60; continue
+              busy_since="${busy_since:-$SECONDS}"
+              echo "Another archive pass is running; waiting 60 s ($(head -c 300 batch.json 2>/dev/null))"
+              # A batch never holds the lock for more than ~3 minutes; 35 minutes of busy means a stuck lock.
+              if [ $((SECONDS - busy_since)) -ge 2100 ]; then
+                echo "::error::Archive lock has been busy for 35+ minutes; it looks stuck (see the lock details above)"
+                exit 1
+              fi
+              sleep 60; continue
             fi
+            busy_since=""
             if [ "$status" != "200" ] || ! jq -e '.attempted != null' batch.json > /dev/null 2>&1; then
               errors=$((errors + 1))
               echo "Batch request failed (HTTP $status, error $errors of 5): $(head -c 200 batch.json 2>/dev/null)"
