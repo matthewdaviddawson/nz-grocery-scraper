@@ -11,8 +11,9 @@ on:
 
 env:
   PRICESMART_APP_URL: ${{ vars.PRICESMART_APP_URL }}
-  BATCH_LIMIT: "60"
-  BATCH_SECONDS: "90"
+  # Small batches: the hosting gateway drops requests that run too long (HTTP 503).
+  BATCH_LIMIT: "25"
+  BATCH_SECONDS: "40"
   RUN_MINUTES: "100"
 
 concurrency:
@@ -44,21 +45,23 @@ jobs:
               "$url")" || status="000"
 
             if [ "$status" = "409" ]; then
+              # Usually our own previous batch, still finishing after the gateway gave up on it.
+              errors=0
               busy_since="${busy_since:-$SECONDS}"
-              echo "Another archive pass is running; waiting 60 s ($(head -c 300 batch.json 2>/dev/null))"
+              echo "Another archive pass is running; waiting 30 s ($(head -c 300 batch.json 2>/dev/null))"
               # A batch never holds the lock for more than ~3 minutes; 35 minutes of busy means a stuck lock.
               if [ $((SECONDS - busy_since)) -ge 2100 ]; then
                 echo "::error::Archive lock has been busy for 35+ minutes; it looks stuck (see the lock details above)"
                 exit 1
               fi
-              sleep 60; continue
+              sleep 30; continue
             fi
             busy_since=""
             if [ "$status" != "200" ] || ! jq -e '.attempted != null' batch.json > /dev/null 2>&1; then
               errors=$((errors + 1))
-              echo "Batch request failed (HTTP $status, error $errors of 5): $(head -c 200 batch.json 2>/dev/null)"
-              [ $errors -lt 5 ] || { echo "Too many consecutive errors"; exit 1; }
-              sleep $((errors * 30)); continue
+              echo "Batch request failed (HTTP $status, error $errors of 8): $(head -c 200 batch.json 2>/dev/null)"
+              [ $errors -lt 8 ] || { echo "::error::Too many consecutive errors"; exit 1; }
+              sleep $(( errors * 20 < 90 ? errors * 20 : 90 )); continue
             fi
             errors=0; batches=$((batches + 1))
             archived="$(jq -r '.archived' batch.json)"; total=$((total + archived))
