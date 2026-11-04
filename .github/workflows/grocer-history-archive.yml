@@ -57,6 +57,28 @@ jobs:
               sleep 30; continue
             fi
             busy_since=""
+
+            # The server accepts the batch (202) and works in the background; poll until it finishes.
+            if [ "$status" = "202" ]; then
+              run_id="$(jq -r '.passRunId // empty' batch.json 2>/dev/null)"
+              if [ -n "$run_id" ]; then
+                finished=""
+                for poll in $(seq 1 36); do
+                  sleep 10
+                  poll_status="$(curl --silent --show-error --max-time 30 -o poll.json -w '%{http_code}' \
+                    -H "Authorization: Bearer ${INGEST_SECRET}" "$url/$run_id")" || poll_status="000"
+                  if [ "$poll_status" = "200" ] && jq -e '.attempted != null' poll.json > /dev/null 2>&1; then
+                    cp poll.json batch.json; finished=1; break
+                  fi
+                done
+                if [ -z "$finished" ]; then
+                  echo "Batch $run_id still not finished after 6 min (last reply: HTTP $poll_status $(head -c 200 poll.json 2>/dev/null)); moving on"
+                  continue
+                fi
+                status="200"
+              fi
+            fi
+
             if [ "$status" != "200" ] || ! jq -e '.attempted != null' batch.json > /dev/null 2>&1; then
               errors=$((errors + 1))
               echo "Batch request failed (HTTP $status, error $errors of 8): $(head -c 200 batch.json 2>/dev/null)"
