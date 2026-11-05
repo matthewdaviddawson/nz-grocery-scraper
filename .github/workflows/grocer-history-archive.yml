@@ -1,20 +1,13 @@
 name: Grocer history archive
 
-# Drives PriceSmart's Grocer history archive in short batches. Each request archives
-# one batch and returns within about 2 minutes, so it never depends on the app server
-# keeping a long background job alive.
+# Copies Grocer.nz price history into PriceSmart. The heavy work (downloading each
+# product's history file and reducing it to the days its price changed) runs here on
+# GitHub; PriceSmart only hands out the to-do list and stores the small results.
 
 on:
   schedule:
     - cron: "23 */2 * * *" # every 2 hours; finishes in about a minute once nothing is due
   workflow_dispatch:
-
-env:
-  PRICESMART_APP_URL: ${{ vars.PRICESMART_APP_URL }}
-  # Small batches: the hosting gateway drops requests that run too long (HTTP 503).
-  BATCH_LIMIT: "25"
-  BATCH_SECONDS: "40"
-  RUN_MINUTES: "100"
 
 concurrency:
   group: grocer-history-archive
@@ -25,73 +18,272 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 115
     steps:
-      - name: Archive batches until nothing is due
-        env:
-          INGEST_SECRET: ${{ secrets.INGEST_SECRET }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Set up the archiver
+        working-directory: ${{ runner.temp }}
         run: |
-          set -uo pipefail
-          test -n "$PRICESMART_APP_URL" || { echo "Set the PRICESMART_APP_URL repository variable"; exit 1; }
-          test -n "$INGEST_SECRET" || { echo "Set the INGEST_SECRET repository secret"; exit 1; }
-          url="${PRICESMART_APP_URL%/}/api/admin/archive/batch"
-          deadline=$((SECONDS + RUN_MINUTES * 60))
-          batches=0; total=0; errors=0; busy_since=""
+          mkdir -p archive && cd archive
+          npm init -y > /dev/null
+          npm install --no-audit --no-fund --silent hyparquet@1.12.0
+          cat > grocer-archive.mjs <<'ARCHIVER'
+          // Archives Grocer.nz per-product price history into PriceSmart.
+          //
+          // Asks PriceSmart which products are due (GET /api/admin/archive/due), downloads each
+          // product's Grocer history parquet file, reduces it to the days each store's price
+          // changed, and uploads the results (POST /api/admin/archive/ingest). All the heavy work
+          // happens here, so the PriceSmart server only stores small, ready-made results.
+          //
+          // Env: PRICESMART_APP_URL, INGEST_SECRET, RUN_MINUTES (default 100),
+          //      CONCURRENCY (default 6), DRY_RUN_IDS (comma-separated ids: parse only, no API calls).
 
-          while [ $SECONDS -lt $deadline ]; do
-            status="$(curl --silent --show-error --max-time $((BATCH_SECONDS + 60)) \
-              -o batch.json -w '%{http_code}' -X POST \
-              -H "Authorization: Bearer ${INGEST_SECRET}" \
-              -H "Content-Type: application/json" \
-              -d "{\"limit\": ${BATCH_LIMIT}, \"maxSeconds\": ${BATCH_SECONDS}}" \
-              "$url")" || status="000"
+          import { gzipSync, zstdDecompressSync } from 'node:zlib';
+          import { parquetReadObjects } from 'hyparquet';
 
-            if [ "$status" = "409" ]; then
-              # Usually our own previous batch, still finishing after the gateway gave up on it.
-              errors=0
-              busy_since="${busy_since:-$SECONDS}"
-              echo "Another archive pass is running; waiting 30 s ($(head -c 300 batch.json 2>/dev/null))"
-              # A batch never holds the lock for more than ~3 minutes; 35 minutes of busy means a stuck lock.
-              if [ $((SECONDS - busy_since)) -ge 2100 ]; then
-                echo "::error::Archive lock has been busy for 35+ minutes; it looks stuck (see the lock details above)"
-                exit 1
-              fi
-              sleep 30; continue
-            fi
-            busy_since=""
+          const GROCER_URL = (id) => `https://assets-prod.grocer.nz/public/price_history_v3/price_history_${id}.parquet`;
+          const USER_AGENT = 'PriceSmart history archive (GitHub Actions)';
+          const EPOCH = Date.UTC(2020, 0, 1);
+          const DAY_MS = 86_400_000;
+          const UPLOAD_ITEMS = 100; // server maximum is 200
+          const UPLOAD_BYTES = 6 * 1024 * 1024; // server maximum is 10 MiB uncompressed
 
-            # The server accepts the batch (202) and works in the background; poll until it finishes.
-            if [ "$status" = "202" ]; then
-              run_id="$(jq -r '.passRunId // empty' batch.json 2>/dev/null)"
-              if [ -n "$run_id" ]; then
-                finished=""
-                for poll in $(seq 1 36); do
-                  sleep 10
-                  poll_status="$(curl --silent --show-error --max-time 30 -o poll.json -w '%{http_code}' \
-                    -H "Authorization: Bearer ${INGEST_SECRET}" "$url/$run_id")" || poll_status="000"
-                  if [ "$poll_status" = "200" ] && jq -e '.attempted != null' poll.json > /dev/null 2>&1; then
-                    cp poll.json batch.json; finished=1; break
-                  fi
-                done
-                if [ -z "$finished" ]; then
-                  echo "Batch $run_id still not finished after 6 min (last reply: HTTP $poll_status $(head -c 200 poll.json 2>/dev/null)); moving on"
-                  continue
-                fi
-                status="200"
-              fi
-            fi
+          const appUrl = (process.env.PRICESMART_APP_URL ?? '').replace(/\/+$/, '');
+          const secret = process.env.INGEST_SECRET ?? '';
+          const runMinutes = Number(process.env.RUN_MINUTES ?? 100);
+          const concurrency = Number(process.env.CONCURRENCY ?? 6);
+          const deadline = Date.now() + runMinutes * 60_000;
+          const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
-            if [ "$status" != "200" ] || ! jq -e '.attempted != null' batch.json > /dev/null 2>&1; then
-              errors=$((errors + 1))
-              echo "Batch request failed (HTTP $status, error $errors of 8): $(head -c 200 batch.json 2>/dev/null)"
-              [ $errors -lt 8 ] || { echo "::error::Too many consecutive errors"; exit 1; }
-              sleep $(( errors * 20 < 90 ? errors * 20 : 90 )); continue
-            fi
-            errors=0; batches=$((batches + 1))
-            archived="$(jq -r '.archived' batch.json)"; total=$((total + archived))
-            jq -r '"batch '"$batches"': attempted \(.attempted), archived \(.archived), failed \(.failed), " +
-                   "\(.durationMs / 1000 | floor)s, not yet archived \(.notYetArchived), still due \(.remaining)"' batch.json
+          // ---------------------------------------------------------------------------
+          // Reducing a Grocer history file
 
-            if [ "$(jq -r '.remaining' batch.json)" = "0" ]; then echo "Nothing left to archive right now"; break; fi
-            if [ "$(jq -r '.attempted' batch.json)" = "0" ]; then echo "Nothing attempted; stopping until next run"; break; fi
-          done
+          const nzDateFormat = new Intl.DateTimeFormat('en-CA', { timeZone: 'Pacific/Auckland', year: 'numeric', month: '2-digit', day: '2-digit' });
+          const nzDayByHour = new Map(); // NZ offsets are whole hours, so one lookup per UTC hour is exact
 
-          echo "Done: $total archived in $batches batches over $((SECONDS / 60)) min"
+          /** Days since 2020-01-01 of the Pacific/Auckland calendar date of an instant. */
+          function nzDayIndex(ms) {
+            const hour = Math.floor(ms / 3_600_000);
+            let day = nzDayByHour.get(hour);
+            if (day === undefined) {
+              const [y, m, d] = nzDateFormat.format(new Date(hour * 3_600_000)).split('-').map(Number);
+              day = Math.round((Date.UTC(y, m - 1, d) - EPOCH) / DAY_MS);
+              nzDayByHour.set(hour, day);
+            }
+            return day;
+          }
+
+          const toMs = (value) => (value instanceof Date ? value.getTime() : typeof value === 'bigint' ? Number(value) : Number(value));
+
+          /** Parquet bytes -> { stores: { "<id>": [[dayDelta, cents], ...] }, points, skipped } */
+          export async function reduceHistory(bytes) {
+            const file = bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength);
+            const rows = await parquetReadObjects({
+              file,
+              columns: ['updated_at', 'store_id', 'price_cent'],
+              compressors: { ZSTD: (input) => new Uint8Array(zstdDecompressSync(input)) },
+            });
+
+            // Last price (greatest updated_at; ties go to the later row) per store per NZ day.
+            const byStore = new Map();
+            let skipped = 0;
+            for (const row of rows) {
+              const price = Number(row.price_cent);
+              const storeId = row.store_id == null ? NaN : Number(row.store_id);
+              const ms = toMs(row.updated_at);
+              if (!(price > 0) || !Number.isInteger(storeId) || storeId <= 0 || !Number.isFinite(ms)) { skipped++; continue; }
+              const day = nzDayIndex(ms);
+              if (day < 0) { skipped++; continue; } // before 2020-01-01: not representable
+              let days = byStore.get(storeId);
+              if (!days) byStore.set(storeId, (days = new Map()));
+              const current = days.get(day);
+              if (!current || ms >= current.ms) days.set(day, { ms, price });
+            }
+
+            // Keep the first price and each later change, delta-encoded by day within each store.
+            const stores = {};
+            let points = 0;
+            for (const [storeId, days] of byStore) {
+              const encoded = [];
+              let lastDay = 0;
+              let lastPrice;
+              for (const day of [...days.keys()].sort((a, b) => a - b)) {
+                const { price } = days.get(day);
+                if (price === lastPrice) continue;
+                encoded.push([day - lastDay, price]);
+                lastDay = day;
+                lastPrice = price;
+              }
+              if (encoded.length) { stores[String(storeId)] = encoded; points += encoded.length; }
+            }
+            return { stores, points, rows: rows.length, skipped };
+          }
+
+          // ---------------------------------------------------------------------------
+          // HTTP helpers
+
+          async function request(url, init = {}, { timeoutMs = 60_000 } = {}) {
+            return fetch(url, { ...init, signal: AbortSignal.timeout(timeoutMs) });
+          }
+
+          /** Downloads one Grocer file. Returns bytes, or null when Grocer has no file (404). */
+          async function downloadGrocer(id) {
+            let lastError;
+            for (const wait of [0, 2_000, 10_000, 30_000]) {
+              if (wait) await sleep(wait);
+              try {
+                const response = await request(GROCER_URL(id), { headers: { 'user-agent': USER_AGENT } }, { timeoutMs: 30_000 });
+                if (response.status === 404) return null;
+                if (response.ok) return new Uint8Array(await response.arrayBuffer());
+                lastError = `Grocer HTTP ${response.status}`;
+                if (response.status < 500 && response.status !== 429) break; // not worth retrying
+              } catch (error) {
+                lastError = error?.name === 'TimeoutError' ? 'Grocer download timed out' : String(error?.message ?? error);
+              }
+            }
+            throw new Error(lastError);
+          }
+
+          async function api(path, init = {}) {
+            let lastError;
+            for (const wait of [0, 5_000, 15_000, 30_000, 60_000]) {
+              if (wait) await sleep(wait);
+              try {
+                const response = await request(`${appUrl}${path}`, {
+                  ...init,
+                  headers: { authorization: `Bearer ${secret}`, accept: 'application/json', ...init.headers },
+                });
+                const text = await response.text();
+                if (response.ok) return JSON.parse(text);
+                lastError = `HTTP ${response.status}: ${text.slice(0, 200)}`;
+                if (response.status === 401 || response.status === 400 || response.status === 413) break;
+              } catch (error) {
+                lastError = String(error?.message ?? error);
+              }
+              console.log(`  PriceSmart request ${path.split('?')[0]} failed (${lastError}); retrying`);
+            }
+            throw new Error(`PriceSmart request ${path.split('?')[0]} failed: ${lastError}`);
+          }
+
+          // ---------------------------------------------------------------------------
+          // Main loop
+
+          const totals = { processed: 0, ok: 0, notFound: 0, failed: 0, rejected: 0, uploads: 0 };
+          let pending = [];
+          let pendingBytes = 0;
+          let lastCounts = {};
+
+          async function flush() {
+            if (!pending.length) return;
+            const items = pending;
+            pending = [];
+            pendingBytes = 0;
+            const body = gzipSync(JSON.stringify({ items }));
+            const result = await api('/api/admin/archive/ingest', {
+              method: 'POST',
+              headers: { 'content-type': 'application/json', 'content-encoding': 'gzip' },
+              body,
+            });
+            totals.uploads++;
+            totals.rejected += result.rejected?.length ?? 0;
+            for (const rejection of result.rejected ?? []) console.log(`  rejected ${rejection.grocerProductId}: ${rejection.reason}`);
+            lastCounts = { notYetArchived: result.notYetArchived, remaining: result.remaining };
+            console.log(`upload ${totals.uploads}: ${items.length} items (merged ${result.merged}, not found ${result.notFound}, failed ${result.failed}, rejected ${result.rejected?.length ?? 0}); not yet archived ${result.notYetArchived}, still due ${result.remaining}`);
+          }
+
+          async function queue(item) {
+            const size = item.history ? JSON.stringify(item.history).length : 100;
+            if (pending.length && (pending.length >= UPLOAD_ITEMS || pendingBytes + size > UPLOAD_BYTES)) await flush();
+            pending.push(item);
+            pendingBytes += size;
+          }
+
+          async function processProduct(id) {
+            try {
+              const bytes = await downloadGrocer(id);
+              if (!bytes) { totals.notFound++; return { grocerProductId: id, status: 'not_found' }; }
+              const { stores, points } = await reduceHistory(bytes);
+              if (!points) { totals.notFound++; return { grocerProductId: id, status: 'not_found' }; }
+              totals.ok++;
+              return { grocerProductId: id, status: 'ok', history: { v: 1, stores } };
+            } catch (error) {
+              totals.failed++;
+              return { grocerProductId: id, status: 'failed', error: String(error?.message ?? error).slice(0, 500) };
+            } finally {
+              totals.processed++;
+            }
+          }
+
+          /** Runs processProduct over ids with limited concurrency, queueing results in order of completion. */
+          async function processAll(ids) {
+            let next = 0;
+            const worker = async () => {
+              while (next < ids.length && Date.now() < deadline) {
+                const id = ids[next++];
+                await queue(await processProduct(id));
+              }
+            };
+            await Promise.all(Array.from({ length: concurrency }, worker));
+          }
+
+          async function dryRun(ids) {
+            for (const id of ids) {
+              const started = Date.now();
+              const bytes = await downloadGrocer(id);
+              if (!bytes) { console.log(`${id}: not found`); continue; }
+              const { stores, points, rows, skipped } = await reduceHistory(bytes);
+              const storeIds = Object.keys(stores);
+              const sample = storeIds[0];
+              console.log(`${id}: ${(bytes.length / 1024).toFixed(0)} KB, ${rows} rows (${skipped} skipped) -> ${storeIds.length} stores, ${points} change points, ${Date.now() - started} ms; store ${sample} starts ${JSON.stringify(stores[sample]?.slice(0, 4))}`);
+            }
+          }
+
+          async function main() {
+            if (process.env.DRY_RUN_IDS) return dryRun(process.env.DRY_RUN_IDS.split(',').map(Number));
+            if (!appUrl || !secret) throw new Error('Set PRICESMART_APP_URL and INGEST_SECRET');
+
+            const started = Date.now();
+            const seen = new Set(); // never handle a product twice in one run
+            let sweep = 0;
+            while (Date.now() < deadline) {
+              sweep++;
+              let cursor;
+              let handledThisSweep = 0;
+              do {
+                const query = new URLSearchParams({ limit: '500' });
+                if (cursor) query.set('cursor', cursor);
+                const page = await api(`/api/admin/archive/due?${query}`);
+                if (sweep === 1 && !cursor) console.log(`due now: ${page.remaining}, never archived: ${page.notYetArchived}`);
+                const ids = page.items.map((item) => item.grocerProductId).filter((id) => !seen.has(id));
+                ids.forEach((id) => seen.add(id));
+                handledThisSweep += ids.length;
+                await processAll(ids);
+                await flush();
+                cursor = page.nextCursor;
+              } while (cursor && Date.now() < deadline);
+              if (!handledThisSweep) break; // nothing new is due
+            }
+            await flush();
+
+            const minutes = (Date.now() - started) / 60_000;
+            console.log(`Done: ${totals.processed} products in ${minutes.toFixed(1)} min (${(totals.processed / Math.max(minutes, 0.01)).toFixed(0)}/min): ` +
+              `${totals.ok} archived, ${totals.notFound} not on Grocer, ${totals.failed} failed, ${totals.rejected} rejected. ` +
+              `Not yet archived ${lastCounts.notYetArchived ?? '?'}, still due ${lastCounts.remaining ?? '?'}`);
+            if (totals.rejected) console.log(`::warning::PriceSmart rejected ${totals.rejected} item(s); see the "rejected" lines above`);
+          }
+
+          main().catch((error) => {
+            console.error(`::error::${error.message}`);
+            process.exit(1);
+          });
+          ARCHIVER
+
+      - name: Archive Grocer history
+        working-directory: ${{ runner.temp }}/archive
+        env:
+          PRICESMART_APP_URL: ${{ vars.PRICESMART_APP_URL }}
+          INGEST_SECRET: ${{ secrets.INGEST_SECRET }}
+          RUN_MINUTES: "100"
+          CONCURRENCY: "6"
+        run: node grocer-archive.mjs
