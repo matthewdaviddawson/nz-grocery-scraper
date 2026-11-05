@@ -7,7 +7,7 @@ import { mkdir, readFile, rename, writeFile } from 'node:fs/promises';
 import { once } from 'node:events';
 import { join } from 'node:path';
 import { createGzip, gunzipSync, gzipSync } from 'node:zlib';
-import { http, mapLimit } from './http.js';
+import { http, mapLimit, sleep } from './http.js';
 import { PRICE_FIELDS } from './normalize.js';
 
 const NZ_TZ = 'Pacific/Auckland';
@@ -57,6 +57,33 @@ class Ingest {
     this.sent = 0;
   }
 
+  /**
+   * Posts one batch. While the app's host switches to a newly published version it briefly
+   * answers with placeholder pages (404) or errors (5xx) for a minute or two, so a failed
+   * batch is retried for about 7 minutes before giving up. Resending a batch is safe.
+   */
+  async post(body) {
+    const waits = [0, 30_000, 60_000, 120_000, 180_000];
+    for (let attempt = 0; ; attempt++) {
+      try {
+        return await http(this.url, {
+          method: 'POST',
+          json: false,
+          paced: false,
+          timeoutMs: 120_000,
+          retries: 8,
+          headers: { 'content-type': 'application/json', authorization: `Bearer ${this.secret}` },
+          body,
+        });
+      } catch (err) {
+        // A wrong secret or a rejected payload won't fix itself.
+        if (attempt + 1 >= waits.length || err.status === 400 || err.status === 401 || err.status === 413) throw err;
+        console.error(`[${clock()}] [ingest] upload failed (${String(err.message).slice(0, 80)}); retrying in ${waits[attempt + 1] / 1000}s`);
+        await sleep(waits[attempt + 1]);
+      }
+    }
+  }
+
   /** Returns the number of batches that failed. */
   async send(kind, chain, items = [], extra = {}) {
     let failed = 0;
@@ -65,14 +92,8 @@ class Ingest {
     for (const batch of batches) {
       if (!batch.length && kind !== 'run_complete') continue;
       try {
-        await http(this.url, {
-          method: 'POST',
-          json: false,
-          paced: false,
-          timeoutMs: 120_000,
-          retries: 8,
-          headers: { 'content-type': 'application/json', authorization: `Bearer ${this.secret}` },
-          body: JSON.stringify({
+        await this.post(
+          JSON.stringify({
             runId: this.runId,
             chain,
             kind,
@@ -80,7 +101,7 @@ class Ingest {
             ...extra,
             items: batch,
           }),
-        });
+        );
         this.sent += batch.length;
       } catch (err) {
         this.errors++;
