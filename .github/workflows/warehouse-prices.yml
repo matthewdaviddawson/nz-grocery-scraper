@@ -1,0 +1,15 @@
+**The new code is live, but the Warehouse import did not complete successfully.** I can’t yet call this fully fixed.
+
+The single import request returned **HTTP 503**. Database checks show partial progress—**5,000 price rows were refreshed**—but no new successful completion record was saved.
+
+| Live Warehouse status | Before | Now |
+|---|---:|---:|
+| `activePriceCount` | 5,836 | 5,897 |
+| `lastRunAt` | 20 Oct, 19:54:04 UTC | Unchanged |
+| `stale` | `true` | `true` |
+
+The Warehouse lease expired at **02:05:28 UTC**, so it should not permanently block future attempts. Available logs do not establish whether the production worker was recycled or stalled; I won’t claim a specific crash cause.
+
+Checkpoint [6c643315](manus-webdev://6c643315) is deployed and passed **431 tests, with 1 skipped**, plus TypeScript and server-build checks. SuperValue Bell Block remains enabled with **6,430 prices**.
+
+**The remaining issue is completing the import reliably within the hosting constraints.** It needs resumable, short import chunks with durable progress—not another long-running request. I sent no second import request and ran no archive work.
