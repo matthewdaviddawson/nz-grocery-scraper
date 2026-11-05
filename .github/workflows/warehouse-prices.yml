@@ -1,15 +1,325 @@
-**The new code is live, but the Warehouse import did not complete successfully.** I can’t yet call this fully fixed.
+name: Warehouse prices
 
-The single import request returned **HTTP 503**. Database checks show partial progress—**5,000 price rows were refreshed**—but no new successful completion record was saved.
+# Imports The Warehouse's prices into PriceSmart every morning from Grocer.nz's public
+# datasets (used with the Grocer creator's permission; The Warehouse's website blocks
+# automated collection). Runs on GitHub so the PriceSmart server only receives the
+# finished prices through its normal ingest endpoint.
 
-| Live Warehouse status | Before | Now |
-|---|---:|---:|
-| `activePriceCount` | 5,836 | 5,897 |
-| `lastRunAt` | 20 Oct, 19:54:04 UTC | Unchanged |
-| `stale` | `true` | `true` |
+on:
+  schedule:
+    - cron: "15 19 * * *" # 19:15 UTC daily (8:15 am NZDT), after Grocer publishes its files
+  workflow_dispatch:
 
-The Warehouse lease expired at **02:05:28 UTC**, so it should not permanently block future attempts. Available logs do not establish whether the production worker was recycled or stalled; I won’t claim a specific crash cause.
+concurrency:
+  group: warehouse-prices
+  cancel-in-progress: false
 
-Checkpoint [6c643315](manus-webdev://6c643315) is deployed and passed **431 tests, with 1 skipped**, plus TypeScript and server-build checks. SuperValue Bell Block remains enabled with **6,430 prices**.
+jobs:
+  import:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
 
-**The remaining issue is completing the import reliably within the hosting constraints.** It needs resumable, short import chunks with durable progress—not another long-running request. I sent no second import request and ran no archive work.
+      - name: Restore yesterday's product list
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ runner.temp }}/warehouse/state
+          key: warehouse-listed-${{ github.run_id }}
+          restore-keys: warehouse-listed-
+
+      - name: Set up the importer
+        working-directory: ${{ runner.temp }}
+        run: |
+          mkdir -p warehouse && cd warehouse
+          npm init -y > /dev/null
+          npm install --no-audit --no-fund --silent @duckdb/node-api@1.5.6-r.2
+          cat > warehouse-import.mjs <<'IMPORTER'
+          // Imports The Warehouse's prices into PriceSmart from Grocer.nz's public datasets.
+          //
+          // The Warehouse's website blocks automated collection, so Grocer's published file is
+          // the source (used with the Grocer creator's permission). This does the same work the
+          // PriceSmart server's own import did (server/grocer-bridge.ts importWarehousePrices),
+          // but on GitHub, then sends the prices through the scraper's normal ingest endpoint.
+          //
+          // Env: PRICESMART_APP_URL, INGEST_SECRET, STATE_FILE (previous run's product list),
+          //      DRY_RUN=1 (build everything, send nothing).
+
+          import { brotliDecompressSync } from 'node:zlib';
+          import { randomUUID } from 'node:crypto';
+          import { mkdir, readFile, writeFile } from 'node:fs/promises';
+          import { dirname, resolve } from 'node:path';
+          import { DuckDBInstance } from '@duckdb/node-api';
+
+          const GROCER = 'https://assets-prod.grocer.nz/public';
+          const WAREHOUSE_GROCER_STORE_ID = 1; // shared/the-warehouse-branches.ts THE_WAREHOUSE_PRICE_STORE_ID
+          const MIN_WAREHOUSE_PRODUCTS = 500; // fewer means a broken file, not mass delisting
+          const INGEST_BATCH = 500;
+          const USER_AGENT = 'PriceSmart Warehouse import (GitHub Actions)';
+
+          const appUrl = (process.env.PRICESMART_APP_URL ?? '').replace(/\/+$/, '');
+          const secret = process.env.INGEST_SECRET ?? '';
+          const stateFile = resolve(process.env.STATE_FILE ?? 'state/warehouse-listed.json');
+          const dryRun = process.env.DRY_RUN === '1';
+          const sleep = (ms) => new Promise((done) => setTimeout(done, ms));
+
+          // ---------------------------------------------------------------------------
+          // Same rules as the PriceSmart server (shared/product-match.ts, server/grocer-data.ts,
+          // shared/product-images.ts, server/grocer-bridge.ts toWarehousePriceItem).
+
+          const STOP_WORDS = new Set(['the', 'and', 'with', 'of', 'nz', 'new', 'zealand', 'pack', 'pk', 'ea', 'each']);
+          const round3 = (value) => Math.round(value * 1000) / 1000;
+
+          export function parseSize(text) {
+            if (!text) return { sizeValue: null, sizeUnit: null };
+            const s = text.toLowerCase().replace(/,/g, '');
+            const canonical = (value, unit) => {
+              if (unit === 'kg') return { sizeValue: round3(value * 1000), sizeUnit: 'g' };
+              if (/^(g|gm|gms|grams?)$/.test(unit)) return { sizeValue: round3(value), sizeUnit: 'g' };
+              if (unit === 'mg') return { sizeValue: round3(value / 1000), sizeUnit: 'g' };
+              if (/^(l|lt|ltr|litres?|liters?)$/.test(unit)) return { sizeValue: round3(value * 1000), sizeUnit: 'ml' };
+              if (unit === 'ml') return { sizeValue: round3(value), sizeUnit: 'ml' };
+              return { sizeValue: round3(value), sizeUnit: 'ea' };
+            };
+            const unit = '(kg|g|gm|gms|grams?|mg|ml|l|lt|ltr|litres?|liters?)';
+            let m = s.match(new RegExp(`(\\d+)\\s*[x\\u00d7]\\s*(\\d+(?:\\.\\d+)?)\\s*${unit}\\b`));
+            if (m) return canonical(Number(m[1]) * Number(m[2]), m[3]);
+            m = s.match(new RegExp(`(\\d+(?:\\.\\d+)?)\\s*${unit}\\s*[x\\u00d7]\\s*(\\d+)\\b`));
+            if (m) return canonical(Number(m[1]) * Number(m[3]), m[2]);
+            m = s.match(new RegExp(`(\\d+(?:\\.\\d+)?)\\s*${unit}\\b`));
+            if (m) return canonical(Number(m[1]), m[2]);
+            m = s.match(/(\d+)\s*(pk|pack|ea|each|s|pc|pcs|pieces|sachets|rolls|bags)\b/);
+            if (m) return { sizeValue: Number(m[1]), sizeUnit: 'ea' };
+            if (/^\s*(ea|each)\s*$/.test(s)) return { sizeValue: 1, sizeUnit: 'ea' };
+            return { sizeValue: null, sizeUnit: null };
+          }
+
+          export function buildMatchKey({ brand, name, sizeValue, sizeUnit }) {
+            const clean = (value) => (value ?? '')
+              .toLowerCase()
+              .normalize('NFKD')
+              .replace(/[\u0300-\u036f]/g, '')
+              .replace(/(\d+(?:\.\d+)?)\s*(kg|g|ml|l|pk|x)\b/g, ' ')
+              .replace(/[^a-z0-9 ]/g, ' ');
+            const brandWords = clean(brand).split(/\s+/).filter(Boolean);
+            const words = clean(name).split(/\s+/).filter((word) => word && !STOP_WORDS.has(word) && !brandWords.includes(word));
+            const size = sizeValue != null && sizeUnit ? `${sizeValue}${sizeUnit}` : '';
+            return `${brandWords.join(' ')}|${[...new Set(words)].sort().join(' ')}|${size}`;
+          }
+
+          const positive = (value) => {
+            const number = Number(value);
+            return Number.isInteger(number) && number > 0 ? number : null;
+          };
+
+          /** Lowest of the sale, online and regular one-unit prices; throws when none is usable. */
+          function selectPublicEffectivePrice(row) {
+            const usable = [positive(row.sale_price_cent), positive(row.online_price_cent), positive(row.original_price_cent)].filter((cents) => cents !== null);
+            if (!usable.length) throw new Error('Offer has no positive public one-unit price');
+            return { cents: Math.min(...usable) };
+          }
+
+          export function toWarehousePriceItem(row, scrapedAt) {
+            const name = String(row.name ?? '').trim();
+            if (!name) return null;
+            let effective;
+            try {
+              effective = selectPublicEffectivePrice(row);
+            } catch {
+              return null; // no usable price
+            }
+            const regular = positive(row.original_price_cent) ?? effective.cents;
+            const club = positive(row.club_price_cent);
+            const publicMultibuy = positive(row.multibuy_price_cent) && positive(row.multibuy_quantity);
+            const memberMultibuy = !publicMultibuy && positive(row.club_multibuy_price_cent) && positive(row.club_multibuy_quantity);
+            const multibuyQty = publicMultibuy ? positive(row.multibuy_quantity) : memberMultibuy ? positive(row.club_multibuy_quantity) : null;
+            const multibuyTotal = publicMultibuy ? positive(row.multibuy_price_cent) : memberMultibuy ? positive(row.club_multibuy_price_cent) : null;
+            const brand = String(row.brand ?? '').trim() || null;
+            const sizeText = String(row.size ?? row.unit ?? '').trim() || null;
+            const size = parseSize(sizeText);
+            const onSpecial = effective.cents < regular;
+            const productId = positive(row.product_id);
+            if (!productId) return null;
+            return {
+              store_id: 'online',
+              product_id: String(productId),
+              name,
+              brand,
+              size_text: sizeText,
+              size_value: size.sizeValue,
+              size_unit: size.sizeUnit,
+              sold_by: !row.size && /^kg$/i.test(String(row.unit ?? '')) ? 'kg' : 'each',
+              barcode: String(row.barcode ?? '').trim() || null,
+              category: String(row.category ?? '').trim() || null,
+              price: effective.cents / 100,
+              regular_price: regular / 100,
+              member_price: club && club < effective.cents ? club / 100 : null,
+              multibuy_qty: multibuyQty,
+              multibuy_total: multibuyTotal ? multibuyTotal / 100 : null,
+              on_special: onSpecial,
+              promo_label: multibuyQty && multibuyTotal
+                ? `${multibuyQty} for $${(multibuyTotal / 100).toFixed(2)}${memberMultibuy ? ' (members)' : ''}`
+                : onSpecial ? 'Special' : club ? 'Member price' : null,
+              unit_price: null,
+              unit_price_measure: null,
+              in_stock: null,
+              image_url: `${GROCER}/product_images/product_${productId}.avif`,
+              product_url: `https://www.thewarehouse.co.nz/search?q=${encodeURIComponent(name)}`,
+              match_key: buildMatchKey({ brand, name, sizeValue: size.sizeValue, sizeUnit: size.sizeUnit }),
+              scraped_at: scrapedAt,
+            };
+          }
+
+          // ---------------------------------------------------------------------------
+          // Downloading and reading Grocer's files
+
+          async function download(url) {
+            let lastError;
+            for (const wait of [0, 5_000, 20_000, 60_000]) {
+              if (wait) await sleep(wait);
+              try {
+                const response = await fetch(url, { headers: { 'user-agent': USER_AGENT }, signal: AbortSignal.timeout(180_000) });
+                if (response.ok) return Buffer.from(await response.arrayBuffer());
+                lastError = `HTTP ${response.status}`;
+              } catch (error) {
+                lastError = String(error?.message ?? error);
+              }
+            }
+            throw new Error(`Download failed for ${url}: ${lastError}`);
+          }
+
+          async function readGrocerWarehouse(workDir) {
+            await mkdir(workDir, { recursive: true });
+            const pricesPath = resolve(workDir, 'public_prices_1.parquet');
+            const basePath = resolve(workDir, 'base_v3.duckdb');
+            const [prices, base] = await Promise.all([
+              download(`${GROCER}/prices_per_store_v3/public_prices_${WAREHOUSE_GROCER_STORE_ID}.parquet`),
+              download(`${GROCER}/base_v3.duckdb.br`),
+            ]);
+            await writeFile(pricesPath, prices);
+            // Grocer serves the .br file with Content-Encoding: br, so fetch usually unpacks it already.
+            const isDuckDb = base.subarray(8, 12).toString('latin1') === 'DUCK';
+            await writeFile(basePath, isDuckDb ? base : brotliDecompressSync(base));
+            console.log(`Downloaded Grocer files: Warehouse prices ${(prices.length / 1024).toFixed(0)} KB, catalogue ${(base.length / 1048576).toFixed(1)} MB`);
+
+            const instance = await DuckDBInstance.create(basePath, { access_mode: 'READ_ONLY' });
+            const connection = await instance.connect();
+            const parquet = pricesPath.replaceAll("'", "''");
+            const query = async (sql) => (await connection.runAndReadAll(sql)).getRowObjectsJS();
+            const rows = await query(`
+              SELECT w.product_id, w.original_price_cent, w.sale_price_cent, w.club_price_cent, w.online_price_cent,
+                     w.multibuy_price_cent, w.multibuy_quantity, w.club_multibuy_price_cent, w.club_multibuy_quantity,
+                     trim(p.name) AS name, nullif(trim(p.brand), '') AS brand, p.size, p.unit,
+                     (SELECT min(b.barcode) FROM public_barcodes b WHERE b.product_id = w.product_id) AS barcode,
+                     (SELECT c.name FROM public_collection_members m JOIN public_collections c ON c.id = m.collection_id
+                       WHERE m.product_id = w.product_id AND c.name <> 'All' ORDER BY c.id LIMIT 1) AS category
+              FROM read_parquet('${parquet}') w JOIN public_products p ON p.id = w.product_id
+              WHERE w.store_id = ${WAREHOUSE_GROCER_STORE_ID}`);
+            const listed = (await query(`SELECT DISTINCT product_id FROM read_parquet('${parquet}')`)).map((row) => String(Number(row.product_id)));
+            connection.closeSync?.();
+            instance.closeSync?.();
+            return { rows, listed };
+          }
+
+          // ---------------------------------------------------------------------------
+          // Sending to PriceSmart (same envelope as the scraper: src/lib/run.js)
+
+          const runId = `${new Date().toISOString().replace(/[:.]/g, '-')}-warehouse-${randomUUID().slice(0, 8)}`;
+          let ingestErrors = 0;
+
+          async function send(kind, items, extra = {}) {
+            const batches = [];
+            for (let i = 0; i < Math.max(items.length, 1); i += INGEST_BATCH) batches.push(items.slice(i, i + INGEST_BATCH));
+            for (const batch of batches) {
+              if (!batch.length && kind !== 'run_complete') continue;
+              const body = JSON.stringify({ runId, chain: 'warehouse', kind, scrapedAt: new Date().toISOString(), ...extra, items: batch });
+              if (dryRun) { console.log(`[dry run] would send ${kind} (${batch.length} items, ${(body.length / 1024).toFixed(0)} KB)`); continue; }
+              let lastError;
+              let ok = false;
+              for (const wait of [0, 5_000, 15_000, 30_000, 60_000]) {
+                if (wait) await sleep(wait);
+                try {
+                  const response = await fetch(`${appUrl}/api/ingest/prices`, {
+                    method: 'POST',
+                    headers: { 'content-type': 'application/json', authorization: `Bearer ${secret}` },
+                    body,
+                    signal: AbortSignal.timeout(120_000),
+                  });
+                  if (response.ok) { ok = true; break; }
+                  lastError = `HTTP ${response.status}: ${(await response.text()).slice(0, 200)}`;
+                  if (response.status === 400 || response.status === 401 || response.status === 413) break;
+                } catch (error) {
+                  lastError = String(error?.message ?? error);
+                }
+                console.log(`  ${kind} upload failed (${lastError}); retrying`);
+              }
+              if (!ok) { ingestErrors++; console.log(`::error::${kind} batch of ${batch.length} could not be sent: ${lastError}`); }
+            }
+          }
+
+          // ---------------------------------------------------------------------------
+
+          async function main() {
+            if (!dryRun && (!appUrl || !secret)) throw new Error('Set PRICESMART_APP_URL and INGEST_SECRET');
+
+            const { rows, listed } = await readGrocerWarehouse(resolve(process.env.RUNNER_TEMP ?? '.', 'warehouse-grocer'));
+            const scrapedAt = new Date().toISOString();
+            const items = rows.map((row) => toWarehousePriceItem(row, scrapedAt)).filter(Boolean);
+            if (items.length < MIN_WAREHOUSE_PRODUCTS) {
+              throw new Error(`Grocer's Warehouse file has only ${items.length} usable products; skipping so prices aren't wrongly removed`);
+            }
+            const awaitingCatalogue = new Set(listed).size - items.length;
+            console.log(`Warehouse: ${items.length} products with prices (${awaitingCatalogue} more listed but not yet in Grocer's catalogue)`);
+
+            // Products in yesterday's file but not today's have stopped being sold.
+            let previous = null;
+            try { previous = JSON.parse((await readFile(stateFile, 'utf8')).replace(/^\uFEFF/, '')).listed; } catch { /* first run */ }
+            const listedSet = new Set(listed);
+            const removed = previous ? previous.filter((id) => !listedSet.has(id)).map((id) => ({ store_id: 'online', product_id: id })) : [];
+            console.log(previous ? `${removed.length} products no longer listed since the last run` : 'No previous run saved; not removing anything this time');
+
+            if (dryRun) {
+              const sample = items.find((item) => item.multibuy_qty) ?? items[0];
+              console.log('Sample item:', JSON.stringify(sample, null, 2));
+              const specials = items.filter((item) => item.on_special).length;
+              console.log(`Specials: ${specials}, with barcode: ${items.filter((i) => i.barcode).length}, with category: ${items.filter((i) => i.category).length}, sized: ${items.filter((i) => i.size_value != null).length}`);
+            }
+
+            await send('stores', [{ store_id: 'online', name: 'The Warehouse (national prices)', region: null, address: null, latitude: null, longitude: null, url: 'https://www.thewarehouse.co.nz' }]);
+            await send('prices', items);
+            await send('removed', removed);
+            const ok = ingestErrors === 0;
+            await send('run_complete', [], {
+              stats: { ok, chain: 'warehouse', products: items.length, awaitingCatalogue, removed: removed.length, source: 'Grocer.nz public datasets', importedBy: 'github-actions' },
+            });
+
+            if (!ok) throw new Error(`${ingestErrors} upload(s) failed; the product list was not saved, so the next run resends everything`);
+            if (!dryRun) {
+              await mkdir(dirname(stateFile), { recursive: true });
+              await writeFile(stateFile, JSON.stringify({ savedAt: scrapedAt, listed }));
+            }
+            console.log(`Done: ${items.length} Warehouse prices ${dryRun ? 'prepared (dry run)' : 'sent'}, ${removed.length} removed`);
+          }
+
+          main().catch((error) => {
+            console.error(`::error::${error.message}`);
+            process.exit(1);
+          });
+          IMPORTER
+
+      - name: Import Warehouse prices
+        working-directory: ${{ runner.temp }}/warehouse
+        env:
+          PRICESMART_APP_URL: ${{ vars.PRICESMART_APP_URL }}
+          INGEST_SECRET: ${{ secrets.INGEST_SECRET }}
+          STATE_FILE: ${{ runner.temp }}/warehouse/state/warehouse-listed.json
+        run: node warehouse-import.mjs
+
+      - name: Save today's product list
+        if: success()
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ runner.temp }}/warehouse/state
+          key: warehouse-listed-${{ github.run_id }}
