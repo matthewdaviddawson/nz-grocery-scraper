@@ -70,6 +70,7 @@ class Ingest {
           json: false,
           paced: false,
           timeoutMs: 120_000,
+          retries: 8,
           headers: { 'content-type': 'application/json', authorization: `Bearer ${this.secret}` },
           body: JSON.stringify({
             runId: this.runId,
