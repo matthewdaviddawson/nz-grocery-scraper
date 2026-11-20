@@ -1,9 +1,12 @@
 // FreshChoice + SuperValue (Woolworths-owned franchise stores). Each store has
 // its own online shop at <store>.store.freshchoice.co.nz / .supervalue.co.nz.
 // There is no JSON API, so product tiles are parsed from the search pages.
+// Stores without online ordering ("Shop in-store") list the same products as a
+// compact list instead of tiles; stores with no shop at all are skipped.
 
 import { http, HttpError } from '../lib/http.js';
 import { decodeHtml, money, priceRecord, storeRecord } from '../lib/normalize.js';
+import { StoreSkipped } from '../lib/run.js';
 
 const DIRECTORY_URL = 'https://store.freshchoice.co.nz/';
 const PAGE_SIZE = 48;
@@ -66,7 +69,70 @@ function findAnalytics(analytics, i, name) {
   return analytics.find((a) => simplify(a.item_name).includes(key)) ?? null;
 }
 
-function parseTiles(html, baseUrl) {
+/** Product records from a search page, in whichever layout the store uses. */
+export function parseTiles(html, baseUrl) {
+  return html.includes('class="TalkerGrid__Item"') ? parseGrid(html, baseUrl) : parseLines(html, baseUrl);
+}
+
+/**
+ * The compact list used by "Shop in-store" stores. Each line has the price, unit
+ * price and, for specials, a "Save $x" label (the normal price is price + saving).
+ */
+export function parseLines(html, baseUrl) {
+  const analytics = parseDataLayer(html);
+  const chunks = html.split(/<div class="line mfl-line-compact[\s"]/).slice(1);
+  const lines = [];
+  chunks.forEach((chunk, i) => {
+    const id = first(chunk, /id="line_([0-9a-f]+)"/);
+    const name = first(chunk, /talker__product-name">([^<]+)/);
+    const priceMatch = chunk.match(/item-per-unit-cost[^>]*>\s*\$([\d.,]+)\s*([^<]*)</);
+    const sell = money(priceMatch?.[1]);
+    if (!id || !name || sell == null) return;
+
+    const units = decodeHtml(priceMatch[2] ?? '');
+    const soldByKg = /kg/i.test(units);
+    const savingMatch = chunk.match(/saving-amount">\s*Save(?:&nbsp;|\s)*(?:\$([\d.,]+)|(\d+)\s*c)/i);
+    const saving = savingMatch ? (savingMatch[1] ? money(savingMatch[1]) : money(Number(savingMatch[2]) / 100)) : null;
+    const savingText = first(chunk, /saving-amount">([\s\S]*?)<\/span>/);
+    const unitMatch = chunk.match(/comparison_price[^>]*>\s*\(?\s*\$([\d.,]+)\s*(?:per\s*)?([^)<]*)/i);
+
+    const info = findAnalytics(analytics, i, name);
+    const category = info
+      ? [info.item_category, info.item_category2, info.item_category3].filter(Boolean).join(' > ') || null
+      : null;
+
+    lines.push(
+      priceRecord({
+        product_id: id,
+        name,
+        brand: info?.item_brand?.trim() || null,
+        size_text: soldByKg ? 'per kg' : first(chunk, /class="weak size">([^<]+)/),
+        sold_by: soldByKg ? 'kg' : 'each',
+        category,
+        price: sell,
+        regular_price: saving ? money(sell + saving) : sell,
+        on_special: Boolean(saving) || /item-per-unit-cost[^"]*\bspecial\b/.test(chunk),
+        promo_label: savingText,
+        unit_price: unitMatch ? money(unitMatch[1]) : soldByKg ? sell : null,
+        unit_price_measure: unitMatch ? decodeHtml(unitMatch[2]) || null : soldByKg ? '1kg' : null,
+        image_url: first(chunk, /<img[^>]+src="([^"]+)"/),
+        product_url: (() => {
+          const href = first(chunk, /href="(\/lines\/[^"]+)"/);
+          return href ? baseUrl + href : null;
+        })(),
+      }),
+    );
+  });
+  return lines;
+}
+
+/** True when a store's website has a shop (its page title starts "Shop Online at" or "Shop in-store at"). */
+async function hasShop(storeUrl) {
+  const home = await http(`${storeUrl}/`, { json: false });
+  return /<title>[^<]*\bShop\b/i.test(home);
+}
+
+function parseGrid(html, baseUrl) {
   const analytics = parseDataLayer(html);
   const chunks = html.split('class="TalkerGrid__Item"').slice(1);
   const tiles = [];
@@ -135,6 +201,21 @@ function createScraper(brand, id, name) {
           const seen = new Set();
           let total = Infinity;
           const complete = () => seen.size >= total;
+          let firstRequest = true;
+
+          /** Fetches a listing page. A store whose site has no shop at all is skipped, not failed. */
+          const fetchPage = async (url) => {
+            const isFirst = firstRequest;
+            firstRequest = false;
+            try {
+              return await http(url, { json: false });
+            } catch (err) {
+              if (isFirst && err instanceof HttpError && err.status === 404 && !(await hasShop(store.url))) {
+                throw new StoreSkipped('no online shop on its website (store information page only)');
+              }
+              throw err;
+            }
+          };
 
           /** Pages through one listing; returns how many products it holds. */
           const crawl = async (path, sort) => {
@@ -142,7 +223,7 @@ function createScraper(brand, id, name) {
             for (let page = 1; page <= MAX_PAGES && !complete(); page++) {
               if (ctx.maxPages && page > ctx.maxPages) break;
               const join = path.includes('?') ? '&' : '?';
-              const html = await http(`${store.url}${path}${join}sort_by=${sort}&page=${page}`, { json: false });
+              const html = await fetchPage(`${store.url}${path}${join}sort_by=${sort}&page=${page}`);
               if (page === 1) listed = totalResults(html);
               const tiles = parseTiles(html, store.url);
               const fresh = tiles.filter((t) => !seen.has(t.product_id));

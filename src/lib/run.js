@@ -155,12 +155,20 @@ export class Run {
     for (const r of results) {
       console.log(
         `  ${r.chain.padEnd(12)} ${r.ok ? 'OK  ' : 'FAIL'} stores ${r.stores_ok}/${r.stores_total}` +
+          (r.stores_skipped?.length ? ` (${r.stores_skipped.length} skipped)` : '') +
           `  products ${r.products}  changed ${r.changed}  removed ${r.removed}${r.error ? `  (${r.error})` : ''}`,
       );
     }
     return summary;
   }
 }
+
+/**
+ * Thrown by a scraper when a listed store has nothing to scrape on purpose (for
+ * example a branch that no longer has an online shop). The store is reported under
+ * stores_skipped instead of stores_failed.
+ */
+export class StoreSkipped extends Error {}
 
 /** The `ctx` object each scraper receives. */
 class ChainRun {
@@ -175,6 +183,7 @@ class ChainRun {
       stores_total: 0,
       stores_ok: 0,
       stores_failed: [],
+      stores_skipped: [],
       products: 0,
       changed: 0,
       removed: 0,
@@ -258,13 +267,18 @@ class ChainRun {
       if (count === 0 && !this.maxPages) throw new Error('no products found (website layout may have changed)');
       this.storesOk.add(store.store_id);
       this.stats.stores_ok++;
-      const idx = `${this.stats.stores_ok + this.stats.stores_failed.length}/${this.stats.stores_total}`;
+      const idx = `${this.stats.stores_ok + this.stats.stores_failed.length + this.stats.stores_skipped.length}/${this.stats.stores_total}`;
       if (globalThis.gc) globalThis.gc(); // only when run with --expose-gc (diagnostics)
       const heapMb = Math.round(process.memoryUsage().heapUsed / 1e6);
       this.log(`(${idx}) ${store.name}: ${count} products in ${Math.round((Date.now() - started) / 1000)}s (memory ${heapMb} MB)`);
     } catch (err) {
-      this.stats.stores_failed.push({ store_id: store.store_id, name: store.name, error: err.message });
-      this.log(`store FAILED ${store.name}: ${err.message}`);
+      if (err instanceof StoreSkipped && count === 0) {
+        this.stats.stores_skipped.push({ store_id: store.store_id, name: store.name, reason: err.message });
+        this.log(`store skipped ${store.name}: ${err.message}`);
+      } else {
+        this.stats.stores_failed.push({ store_id: store.store_id, name: store.name, error: err.message });
+        this.log(`store FAILED ${store.name}: ${err.message}`);
+      }
     }
     this.stats.products += count;
   }
