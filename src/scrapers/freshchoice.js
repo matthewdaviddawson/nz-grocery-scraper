@@ -4,7 +4,7 @@
 // Stores without online ordering ("Shop in-store") list the same products as a
 // compact list instead of tiles; stores with no shop at all are skipped.
 
-import { http, HttpError } from '../lib/http.js';
+import { http, HttpError, USER_AGENT } from '../lib/http.js';
 import { decodeHtml, money, priceRecord, storeRecord } from '../lib/normalize.js';
 import { StoreSkipped } from '../lib/run.js';
 
@@ -42,6 +42,43 @@ async function loadDirectory() {
         address: mapQuery ? decodeURIComponent(mapQuery[1].replace(/\+/g, ' ')) : null,
         url: `https://${sub}.store.${brand}.co.nz`,
       }),
+    });
+  }
+  return stores;
+}
+
+// SuperValue keeps its own store chooser; some of its shops (e.g. Milton) are only listed there.
+const SUPERVALUE_CHOOSER_URL = 'https://store.supervalue.co.nz/multipage';
+
+/**
+ * Stores from SuperValue's own chooser. Each card links to /<id>/i_choose_you, which
+ * redirects to that store's shop; the redirect target gives the shop address.
+ */
+export async function loadSuperValueChooser() {
+  const html = await http(SUPERVALUE_CHOOSER_URL, { json: false });
+  const parts = html.split(/<a class="StoreLink StoreLink--Default" href="\/([0-9a-f]{24})\/i_choose_you"/);
+  const stores = [];
+  const seen = new Set();
+  for (let i = 1; i < parts.length; i += 2) {
+    const id = parts[i];
+    if (seen.has(id)) continue;
+    seen.add(id);
+    const card = parts[i + 1].split('</a>')[0];
+    const name = first(card, /StoreLink__Name[^"]*">([^<]+)/)?.trim();
+    if (!name) continue;
+    let shop;
+    try {
+      const res = await fetch(`https://store.supervalue.co.nz/${id}/i_choose_you`, { redirect: 'manual', headers: { 'user-agent': USER_AGENT, 'accept-language': 'en-NZ,en;q=0.9' }, signal: AbortSignal.timeout(30_000) });
+      shop = (res.headers.get('location') ?? '').match(/^https:\/\/([a-z0-9-]+)\.store\.supervalue\.co\.nz/);
+    } catch {
+      continue;
+    }
+    if (!shop) continue;
+    const text = decodeHtml(card.replace(/<[^>]+>/g, ' ')).replace(/\s+/g, ' ').trim();
+    const address = text.slice(text.indexOf(name) + name.length).match(/^\s*(.*?\b\d{4})\b/)?.[1] ?? null;
+    stores.push({
+      brand: 'supervalue',
+      record: storeRecord({ store_id: shop[1], name: `SuperValue ${name}`, address, url: `https://${shop[1]}.store.supervalue.co.nz` }),
     });
   }
   return stores;
@@ -192,7 +229,17 @@ function createScraper(brand, id, name) {
     name,
 
     async run(ctx) {
-      const directory = (await loadDirectory()).filter((s) => s.brand === brand).map((s) => s.record);
+      let listed = await loadDirectory();
+      if (brand === 'supervalue') {
+        // Add shops only SuperValue's own chooser lists. If it fails, keep the FreshChoice list.
+        const extra = await loadSuperValueChooser().catch((err) => {
+          console.warn(`[supervalue] store chooser unavailable: ${err.message}`);
+          return [];
+        });
+        const urls = new Set(listed.map((s) => s.record.url));
+        listed = [...listed, ...extra.filter((s) => !urls.has(s.record.url))];
+      }
+      const directory = listed.filter((s) => s.brand === brand).map((s) => s.record);
       const stores = ctx.selectStores(directory);
       await ctx.addStores(stores);
 

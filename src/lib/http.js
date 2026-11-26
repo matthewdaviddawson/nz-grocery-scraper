@@ -3,7 +3,7 @@
 const DEFAULT_UA =
   'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0 Safari/537.36';
 
-const USER_AGENT = process.env.SCRAPER_USER_AGENT || DEFAULT_UA;
+export const USER_AGENT = process.env.SCRAPER_USER_AGENT || DEFAULT_UA;
 
 let minGapMs = 150;
 const nextSlot = new Map();
